@@ -280,6 +280,10 @@ class EngineCoreClient(ABC):
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
+    async def add_requests_async(self, requests: list[EngineCoreRequest]) -> None:
+        """Send a batch in one input message to a single EngineCore."""
+        raise NotImplementedError("Batch enqueue requires AsyncMPClient")
+
     async def profile_async(
         self,
         is_start: bool = True,
@@ -1296,6 +1300,22 @@ class AsyncMPClient(MPClient):
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
+        self._ensure_output_queue_task()
+
+    async def add_requests_async(self, requests: list[EngineCoreRequest]) -> None:
+        if len(self.core_engines) != 1:
+            raise ValueError("Batch enqueue requires a single EngineCore")
+        for request in requests:
+            request.client_index = self.client_index
+        # Preserve ADD_GROUP -> ABORT ordering even under socket backpressure.
+        send = asyncio.ensure_future(
+            self._send_input(EngineCoreRequestType.ADD_GROUP, requests)
+        )
+        try:
+            await asyncio.shield(send)
+        except asyncio.CancelledError:
+            await send
+            raise
         self._ensure_output_queue_task()
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:

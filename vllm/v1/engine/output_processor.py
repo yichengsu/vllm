@@ -758,6 +758,17 @@ class OutputProcessor:
                 )
                 pooling_output = EMPTY_CPU_TENSOR
 
+            elif req_state.detokenizer is None and finish_reason in (
+                FinishReason.ERROR,
+                FinishReason.ABORT,
+            ):
+                request_error = RequestError(
+                    code="pooling_request_failed",
+                    message=str(stop_reason or "Pooling request failed in EngineCore."),
+                    retryable=False,
+                )
+                pooling_output = EMPTY_CPU_TENSOR
+
             if pooling_output is None:
                 assert req_state.detokenizer is not None
                 assert req_state.logprobs_processor is not None

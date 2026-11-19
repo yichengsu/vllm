@@ -309,6 +309,8 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_CLASSIFY_BATCH_ENQUEUE: bool = False
+    VLLM_CLASSIFY_GROUP_TRACE: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2146,6 +2148,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #     Allows viewing and setting breakpoints in Inductor's code output files.
     "VLLM_COMPILE_CACHE_SAVE_FORMAT": env_with_choices(
         "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
+    ),
+    # Submit multi-input text classification in one EngineCore message.
+    "VLLM_CLASSIFY_BATCH_ENQUEUE": lambda: bool(
+        int(os.getenv("VLLM_CLASSIFY_BATCH_ENQUEUE", "0"))
+    ),
+    "VLLM_CLASSIFY_GROUP_TRACE": lambda: bool(
+        int(os.getenv("VLLM_CLASSIFY_GROUP_TRACE", "0"))
     ),
     # Flag to control the v2 model runner. If unset, use config defaults.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(

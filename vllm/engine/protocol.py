@@ -40,6 +40,15 @@ class StreamingInput:
     sampling_params: SamplingParams | None = None
 
 
+@dataclass
+class PoolingGroupItem:
+    request_id: str
+    prompt: EngineInput
+    pooling_params: PoolingParams
+    lora_request: LoRARequest | None = None
+    priority: int = 0
+
+
 class EngineClient(ABC):
     """Protocol class for Clients to Engine."""
 
@@ -124,6 +133,15 @@ class EngineClient(ABC):
     ) -> AsyncGenerator[PoolingRequestOutput, None]:
         """Generate outputs for a request from a pooling model."""
         ...
+
+    def encode_group(
+        self,
+        items: list[PoolingGroupItem],
+        group_id: str,
+        trace_headers: Mapping[str, str] | None = None,
+    ) -> AsyncGenerator[tuple[int, PoolingRequestOutput], None]:
+        """Submit a rendered classification batch before the next scheduler step."""
+        raise NotImplementedError("This engine does not support batch enqueue")
 
     @abstractmethod
     async def abort(self, request_id: str | Iterable[str]) -> None:

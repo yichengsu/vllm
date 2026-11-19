@@ -458,3 +458,52 @@ async def test_pooling_not_supported(
     else:
         err_msg = f"Unsupported task: {task!r}"
     assert response.json()["error"]["message"].startswith(err_msg)
+
+
+def test_batch_enqueue_across_steps(tmp_path):
+    from transformers import BertConfig
+
+    # Token IDs and dummy weights keep this scheduling test self-contained.
+    config = BertConfig(
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=2,
+        num_hidden_layers=1,
+        architectures=["BertForSequenceClassification"],
+    )
+    config.save_pretrained(tmp_path)
+    model = str(tmp_path)
+    args = [
+        "--runner",
+        "pooling",
+        "--load-format",
+        "dummy",
+        "--skip-tokenizer-init",
+        "--enforce-eager",
+        "--max-model-len",
+        "512",
+        "--max-num-seqs",
+        "2",
+        "--dtype",
+        DTYPE,
+    ]
+    inputs = [[1, 2, 3, 4], [8, 9], [10, 11, 12], [15]]
+    with RemoteOpenAIServer(
+        model, args, env_dict={"VLLM_CLASSIFY_BATCH_ENQUEUE": "1"}
+    ) as remote:
+
+        def classify(value):
+            response = requests.post(
+                remote.url_for("classify"), json={"model": model, "input": value}
+            )
+            response.raise_for_status()
+            return ClassificationResponse.model_validate(response.json())
+
+        batch = classify(inputs)
+        assert batch.usage.prompt_tokens == sum(map(len, inputs))
+        assert [row.index for row in batch.data] == list(range(len(inputs)))
+        for tokens, row in zip(inputs, batch.data):
+            expected = classify(tokens).data[0]
+            assert row.label == expected.label
+            assert row.probs == pytest.approx(expected.probs, abs=1e-4)

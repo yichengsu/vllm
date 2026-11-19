@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import json
 import os
 import socket
 import time
 from collections.abc import AsyncGenerator, Iterable, Mapping
+from contextlib import aclosing
 from copy import copy
 from typing import Any
 
@@ -21,7 +23,7 @@ from vllm.distributed.weight_transfer.base import (
     WeightTransferUpdateRequest,
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.engine.protocol import EngineClient, StreamingInput
+from vllm.engine.protocol import EngineClient, PoolingGroupItem, StreamingInput
 from vllm.entrypoints.serve.elastic_ep.middleware import set_scaling_elastic_ep
 from vllm.exceptions import (
     GracefulHTTPError,
@@ -46,7 +48,8 @@ from vllm.tokenizers import TokenizerLike
 from vllm.tracing import init_tracer, log_tracing_disabled_warning
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils.async_utils import cancel_task_threadsafe
+from vllm.utils import random_uuid
+from vllm.utils.async_utils import cancel_task_threadsafe, merge_async_iterators
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine import EngineCoreRequest, PauseMode
 from vllm.v1.engine.admission_control import SharedAdmissionStats
@@ -313,7 +316,9 @@ class AsyncLLM(EngineClient):
     def get_num_queued_tokens(self) -> int:
         return self.output_processor.get_num_queued_tokens()
 
-    def check_admission(self, n: int = 1, request_id: str | None = None) -> None:
+    def check_admission(
+        self, n: int = 1, request_id: str | None = None, *, batch_tokens: int = 0
+    ) -> None:
         """Reject the request if it would exceed queue limits.
 
         Both limits return HTTP 503 (Service Unavailable) so that load
@@ -334,6 +339,7 @@ class AsyncLLM(EngineClient):
         Args:
             n: Number of sequences the request will occupy.
             request_id: Request id, used for logging only.
+            batch_tokens: Total prompt tokens for an atomic batch admission check.
 
         Raises:
             QueueOverflowError: If ``max_num_queued_reqs`` would be exceeded.
@@ -362,7 +368,10 @@ class AsyncLLM(EngineClient):
         max_queued_tokens = self.scheduler_config.max_num_queued_tokens
         if max_queued_tokens is not None:
             current_tokens = self.get_num_queued_tokens()
-            if current_tokens >= max_queued_tokens:
+            if (
+                current_tokens >= max_queued_tokens
+                or current_tokens + batch_tokens > max_queued_tokens
+            ):
                 logger.debug(
                     "Max queued tokens reached - rejecting request %s "
                     "(current_tokens=%d, max=%d).",
@@ -991,6 +1000,122 @@ class AsyncLLM(EngineClient):
         """Return whether the engine is currently paused."""
         return await self.engine_core.is_scheduler_paused_async()
 
+    async def encode_group(
+        self,
+        items: list[PoolingGroupItem],
+        group_id: str,
+        trace_headers: Mapping[str, str] | None = None,
+    ) -> AsyncGenerator[tuple[int, PoolingRequestOutput], None]:
+        """Validate all children before registering any; send one ADD_GROUP."""
+        queues: list[RequestOutputCollector] = []
+        submitting = False
+        try:
+            if not items:
+                raise VLLMValidationError(
+                    "A classify batch must contain at least one input"
+                )
+            if self.errored:
+                raise EngineDeadError()
+            if trace_headers and self.observability_config.otlp_traces_endpoint is None:
+                log_tracing_disabled_warning()
+                trace_headers = None
+            supported_tasks = await self.get_supported_tasks()
+            requests: list[EngineCoreRequest] = []
+            prompt_texts: list[str | None] = []
+            # ABORT carries only IDs. Include the API worker in the namespace
+            # so an early disconnect cannot abort another worker's request.
+            batch_id = f"batch:{self.engine_core.client_index}:{random_uuid()}"
+            for index, item in enumerate(items):
+                request = self.input_processor.process_inputs(
+                    item.request_id,
+                    item.prompt,
+                    item.pooling_params,
+                    supported_tasks=supported_tasks,
+                    lora_request=item.lora_request,
+                    priority=item.priority,
+                    trace_headers=trace_headers,
+                )
+                self.input_processor.assign_request_id(
+                    request, suffix=f"{batch_id}:{index}"
+                )
+                requests.append(request)
+                prompt_texts.append(
+                    extract_prompt_components(self.model_config, item.prompt)[0]
+                )
+            ids = [request.request_id for request in requests]
+            if len(set(ids)) != len(ids) or any(
+                self.output_processor.has_request(rid) for rid in ids
+            ):
+                raise VLLMValidationError(
+                    "Duplicate internal request ID in classify batch"
+                )
+            self.check_admission(
+                len(requests),
+                group_id,
+                batch_tokens=sum(len(r.prompt_token_ids or ()) for r in requests),
+            )
+            self._run_output_handler()
+            for request, prompt_text in zip(requests, prompt_texts):
+                queue = RequestOutputCollector(
+                    request.params.output_kind, request.request_id
+                )
+                queues.append(queue)
+                self.output_processor.add_request(request, prompt_text, None, 0, queue)
+            if envs.VLLM_CLASSIFY_GROUP_TRACE:
+                logger.info(
+                    "CLASSIFY_GROUP_SUBMIT %s",
+                    json.dumps(
+                        {
+                            "parent_id": group_id,
+                            "ids": ids,
+                            "tokens": [len(r.prompt_token_ids or ()) for r in requests],
+                        }
+                    ),
+                )
+            submitting = True
+            await self.engine_core.add_requests_async(requests)
+            if self.log_requests:
+                for rid in ids:
+                    logger.info("Added request %s.", rid)
+            async with aclosing(
+                merge_async_iterators(*(self._pooling_outputs(q) for q in queues))
+            ) as outputs:
+                async for indexed_output in outputs:
+                    yield indexed_output
+        except (EngineDeadError, VLLMClientError, GracefulHTTPError):
+            raise
+        except Exception as exc:
+            raise EngineGenerateError() from exc
+        finally:
+            # A child can already have finished or its ID may have been reused.
+            pending = [
+                q.request_id
+                for q in queues
+                if (state := self.output_processor.request_states.get(q.request_id))
+                is not None
+                and state.queue is q
+            ]
+            try:
+                if pending:
+                    if submitting:
+                        await self.abort(pending, internal=True)
+                    else:
+                        self.output_processor.abort_requests(pending, internal=True)
+            finally:
+                for queue in queues:
+                    queue.close()
+
+    @staticmethod
+    async def _pooling_outputs(
+        q: RequestOutputCollector,
+    ) -> AsyncGenerator[PoolingRequestOutput, None]:
+        finished = False
+        while not finished:
+            out = q.get_nowait() or await q.get()
+            assert isinstance(out, PoolingRequestOutput)
+            finished = out.finished
+            yield out
+
     async def encode(
         self,
         prompt: PromptType | EngineInput,
@@ -1027,17 +1152,7 @@ class AsyncLLM(EngineClient):
                 reasoning_ended=reasoning_ended,
             )
 
-            # The output_handler task pushes items into the queue.
-            # This task pulls from the queue and yields to caller.
-            finished = False
-            while not finished:
-                # Note: drain queue without await if possible (avoids
-                # task switching under load which helps performance).
-                out = q.get_nowait() or await q.get()
-                assert isinstance(out, PoolingRequestOutput)
-                # Note: both OutputProcessor and EngineCore handle their
-                # own request cleanup based on finished.
-                finished = out.finished
+            async for out in self._pooling_outputs(q):
                 yield out
 
         # If the request is disconnected by the client, generate()

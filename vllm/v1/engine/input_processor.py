@@ -351,9 +351,9 @@ class InputProcessor:
             )
 
     @staticmethod
-    def assign_request_id(request: EngineCoreRequest):
+    def assign_request_id(request: EngineCoreRequest, *, suffix: str | None = None):
         """Replace the externally supplied request ID with an internal request ID
-        that adds 8 random characters in order to ensure uniqueness.
+        using the provided suffix or eight random hex characters.
         """
         if request.external_req_id is not None:
             raise ValueError(
@@ -368,7 +368,9 @@ class InputProcessor:
                 "request IDs may cause failures and/or subtle correctness errors."
             )
         else:
-            request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
+            if suffix is None:
+                suffix = random_uuid()[:8]
+            request.request_id = f"{request.external_req_id}-{suffix}"
 
     def process_inputs(
         self,

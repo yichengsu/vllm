@@ -250,6 +250,26 @@ curl -v "http://127.0.0.1:8000/classify" \
     }
     ```
 
+### Submitting a text batch to one engine
+
+Set `VLLM_CLASSIFY_BATCH_ENQUEUE=1` to send the rendered text inputs of one
+multi-input `/classify` request to EngineCore in a single message. All inputs
+enter the waiting queue before the next scheduling decision. The scheduler
+still applies its sequence, token and memory budgets to individual inputs.
+A batch may span several steps. The response retains the input order.
+
+The option defaults to off. It applies to the Python frontend with a single
+data-parallel rank, the built-in scheduler, and randomized internal request
+IDs. Other configurations, single-input requests and non-token inputs use
+the ordinary submission path. Queue admission limits apply to the whole
+submission when configured.
+
+For a short diagnostic run, `VLLM_CLASSIFY_GROUP_TRACE=1` logs the ordered
+child IDs and prompt lengths at submission, the IDs after core enqueue, the
+scheduled token counts on each nonempty step, and IDs actually aborted in the
+core. Step records include all scheduled requests. Enable this only while
+collecting a trace, since it logs request IDs and adds per-step overhead.
+
 ## More examples
 
 More examples can be found here: [examples/pooling/classify](../../../examples/pooling/classify)

@@ -13,7 +13,7 @@ from fastapi.responses import Response
 
 from vllm import PoolingRequestOutput, envs
 from vllm.config import VllmConfig
-from vllm.engine.protocol import EngineClient
+from vllm.engine.protocol import EngineClient, PoolingGroupItem
 from vllm.entrypoints.generate.base.protocol import validate_request_mm_kwargs
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.engine.serving import BaseServing
@@ -148,6 +148,16 @@ class PoolingBaseServing(ABC, BaseServing):
             raise ValueError("Engine inputs not available")
 
         generators: list[AsyncGenerator[PoolingRequestOutput, None]] = []
+        grouped = (
+            envs.VLLM_CLASSIFY_BATCH_ENQUEUE
+            and self.request_id_prefix == "classify"
+            and len(ctx.engine_inputs) > 1
+            and self.vllm_config.parallel_config.data_parallel_size == 1
+            and self.vllm_config.scheduler_config.scheduler_cls is None
+            and not envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION
+            and all(item["prompts"]["type"] == "token" for item in ctx.engine_inputs)
+        )
+        group_items: list[PoolingGroupItem] = []
 
         trace_headers = (
             None
@@ -173,6 +183,18 @@ class PoolingBaseServing(ABC, BaseServing):
                 lora_request=ctx.lora_request,
             )
 
+            if grouped:
+                group_items.append(
+                    PoolingGroupItem(
+                        request_id=prompt_request_id,
+                        prompt=engine_input["prompts"],
+                        pooling_params=engine_input["params"],
+                        lora_request=engine_input["lora_requests"],
+                        priority=engine_input["priorities"],
+                    )
+                )
+                continue
+
             generator = self.engine_client.encode(
                 request_id=prompt_request_id,
                 prompt=engine_input["prompts"],
@@ -184,7 +206,11 @@ class PoolingBaseServing(ABC, BaseServing):
 
             generators.append(generator)
 
-        ctx.result_generator = merge_async_iterators(*generators)
+        ctx.result_generator = (
+            self.engine_client.encode_group(group_items, ctx.request_id, trace_headers)
+            if grouped
+            else merge_async_iterators(*generators)
+        )
 
     async def _collect_batch(
         self,
@@ -200,12 +226,17 @@ class PoolingBaseServing(ABC, BaseServing):
         final_res_batch: list[PoolingRequestOutput | None]
         final_res_batch = [None] * num_inputs
 
-        async for i, res in ctx.result_generator:
-            if res.error is not None:
-                if res.error.retryable:
-                    raise RetryableRequestError(res.error.message)
-                raise GenerationError(res.error.message)
-            final_res_batch[i] = res
+        try:
+            async for i, res in ctx.result_generator:
+                if res.error is not None:
+                    if res.error.retryable:
+                        raise RetryableRequestError(res.error.message)
+                    raise GenerationError(res.error.message)
+                final_res_batch[i] = res
+        finally:
+            # Explicit closure releases every child if one output fails or the
+            # HTTP handler is cancelled while collecting the batch.
+            await ctx.result_generator.aclose()
 
         if None in final_res_batch:
             raise ValueError("Failed to generate results for all prompts")

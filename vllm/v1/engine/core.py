@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import json
 import os
 import queue
 import signal
@@ -15,7 +16,7 @@ from functools import partial
 from inspect import isclass, signature
 from logging import DEBUG
 from multiprocessing.queues import Queue
-from typing import Any, TypeVar, cast, get_args
+from typing import TYPE_CHECKING, Any, TypeVar, cast, get_args
 
 import msgspec
 import zmq
@@ -103,6 +104,9 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.scheduler import Scheduler
 
 logger = init_logger(__name__)
 
@@ -556,7 +560,13 @@ class EngineCore:
         # TODO: The scheduler doesn't really need to know the
         # specific finish reason, TBD whether we propagate that
         # (i.e. client-aborted vs stop criteria met).
-        self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+        aborted = self.scheduler.finish_requests(
+            request_ids, RequestStatus.FINISHED_ABORTED
+        )
+        if envs.VLLM_CLASSIFY_GROUP_TRACE and aborted:
+            logger.info(
+                "CLASSIFY_GROUP_ABORT %s", json.dumps([r.request_id for r in aborted])
+            )
 
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
@@ -654,6 +664,14 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    def _schedule(self) -> SchedulerOutput:
+        result = self.scheduler.schedule(self._should_throttle_prefills())
+        if envs.VLLM_CLASSIFY_GROUP_TRACE and result.num_scheduled_tokens:
+            logger.info(
+                "CLASSIFY_GROUP_STEP %s", json.dumps(result.num_scheduled_tokens)
+            )
+        return result
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -664,7 +682,7 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        scheduler_output = self._schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -722,7 +740,7 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            scheduler_output = self._schedule()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -1682,6 +1700,8 @@ class EngineCoreProc(EngineCore):
             if self._reject_add_in_shutdown(req):
                 return
             self.add_request(req, request_wave)
+        elif request_type == EngineCoreRequestType.ADD_GROUP:
+            self._add_request_group(request)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -1704,6 +1724,30 @@ class EngineCoreProc(EngineCore):
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type
             )
+
+    def _add_request_group(self, group: list[tuple[Request, int]]) -> None:
+        # The busy loop dispatches this whole queue entry before scheduling.
+        ids = [r.request_id for r, _ in group]
+        client_index = group[0][0].client_index
+        if self.shutdown_state != EngineShutdownState.RUNNING:
+            self._send_abort_outputs_to_client(ids, client_index)
+            return
+        active = cast("Scheduler", self.scheduler).requests
+        try:
+            if len(set(ids)) != len(ids) or any(rid in active for rid in ids):
+                raise ValueError("Duplicate internal request ID in classify batch")
+            for req, wave in group:
+                self.add_request(req, wave)
+        except Exception:
+            logger.exception("Failed to enqueue classify batch")
+            owned = [
+                req.request_id for req, _ in group if active.get(req.request_id) is req
+            ]
+            self.abort_requests(owned)
+            self._send_error_outputs_to_client(ids, client_index)
+            return
+        if envs.VLLM_CLASSIFY_GROUP_TRACE:
+            logger.info("CLASSIFY_GROUP_ENQUEUE %s", json.dumps(ids))
 
     def _reject_add_in_shutdown(self, request: Request) -> bool:
         if self.shutdown_state == EngineShutdownState.RUNNING:
@@ -1840,6 +1884,9 @@ class EngineCoreProc(EngineCore):
         add_request_decoder = MsgpackDecoder(
             EngineCoreRequest, oob_tensor_provider=self.tensor_ipc_receiver
         )
+        add_group_decoder = MsgpackDecoder(
+            list[EngineCoreRequest], oob_tensor_provider=self.tensor_ipc_receiver
+        )
         generic_decoder = MsgpackDecoder(oob_tensor_provider=self.tensor_ipc_receiver)
 
         with ExitStack() as stack, zmq.Context() as ctx:
@@ -1908,6 +1955,18 @@ class EngineCoreProc(EngineCore):
                             continue
                         except Exception:
                             self._handle_request_preproc_error(req)
+                            continue
+                    elif request_type == EngineCoreRequestType.ADD_GROUP:
+                        group = add_group_decoder.decode(data_frames)
+                        if not group:
+                            continue
+                        try:
+                            request = [self.preprocess_add_request(r) for r in group]
+                        except Exception:
+                            logger.exception("Failed to preprocess classify batch")
+                            self._send_error_outputs_to_client(
+                                [r.request_id for r in group], group[0].client_index
+                            )
                             continue
                     elif request_type == EngineCoreRequestType.UTILITY:
                         request = generic_decoder.decode(data_frames)
